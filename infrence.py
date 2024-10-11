@@ -2,27 +2,33 @@ import torch
 from torch.distributions.normal import Normal
 import numpy as np
 import gymnasium as gym
+from mlagents_envs.environment import UnityEnvironment
+from mlagents_envs.envs.unity_gym_env import UnityToGymWrapper
 
-env = gym.make("HalfCheetah-v4", render_mode="human")
+unity_env = UnityEnvironment("D:\Practice\AIProject\Build\AIProject.exe", no_graphics=False)
+env = UnityToGymWrapper(unity_env)
 
-model = torch.jit.load("models\cheetah_final.pth")
+
+model = torch.jit.load("models\\unity_test_final.pth")
 model.cpu()
 model.eval()
 
 with torch.inference_mode():
-    for i in range(5):
-        observation, _ = env.reset()
+    for i in range(15):
+        observation = env.reset()
         state = torch.tensor(np.array([observation]), dtype=torch.float32)
         done = False
         score = 0
         env.render()
         while not done:
-            loc, scale = model(state)
+            loc, scale_log = model(state)
+            scale = scale_log.exp()
             dist = Normal(loc, scale)
-            action = dist.sample()
-            observation, r, terminated, truncated, _ = env.step(action.numpy()[0])
+            sample = dist.sample()
+            action = torch.tanh(sample)*torch.tensor(env.action_space.high)
+            observation, r, terminated, _ = env.step(action.numpy()[0])
             score += r
-            done = terminated or truncated
+            done = terminated
             state = torch.tensor(np.array([observation]), dtype=torch.float32)
         print(score)
 env.close()
