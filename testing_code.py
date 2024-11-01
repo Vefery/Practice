@@ -9,34 +9,34 @@ import torch.nn.functional as F
 import torch.nn as nn
 import torch.optim as optim
 import gymnasium as gym
-from torch.distributions.normal import Normal
+from torch.distributions.categorical import Categorical
 from mlagents_envs.environment import UnityEnvironment
 from mlagents_envs.envs.unity_gym_env import UnityToGymWrapper
 
 device = (torch.device("cuda"))
-dim = 128
-memory_length = 1
+dim = 256
+memory_length = 32
 lstm_layers = 1
 critic_lr = 3e-4
 actor_lr = critic_lr / 3.0
-policy_noise = 0.2
-noise_clip = 0.5
+reparam_noise = 1e-6
 gamma=0.99
 tau=0.005
+alpha_start = 1
 max_size = 1000000
-batch_size = 4
-total_plays = 1000
+batch_size = 512
+total_plays = 50000
 num_epochs = 1
 N = 1
 
-#unity_env = UnityEnvironment("D:\Practice\SentisInfrence\Build\SentisInfrence.exe", no_graphics=True,)
-#env = UnityToGymWrapper(unity_env)
+unity_env = UnityEnvironment("D:\Practice\SentisInfrence\Build\SentisInfrence.exe", no_graphics=True)
+env = UnityToGymWrapper(unity_env)
 
-env = gym.make("LunarLander-v3", continuous=True)
+#env = gym.make("CartPole-v1")
 
-max_action=env.action_space.high
 obs_dim = env.observation_space.shape
-n_actions=env.action_space.shape[-1]
+n_actions=env.action_space.n
+
 print(obs_dim)
 print(n_actions)
 
@@ -119,8 +119,6 @@ class ReplayBuffer():
                 hist_states_len[i] = hist_seg_len
                 hist_states[i, :hist_seg_len, :] = self.state_memory[hist_start_id:id]
                 hist_actions[i, :hist_seg_len, :] = self.action_memory[hist_start_id:id]
-            
-            hist= np.hstack((hist_actions, hist_states))
 
         hist_part1 = torch.tensor(hist_actions, dtype=torch.float).reshape(batch_size, -1)
         hist_part2 = torch.tensor(hist_states, dtype=torch.float).reshape(batch_size, -1)
@@ -144,7 +142,7 @@ class ReplayBuffer():
                               hidden_actor=self.hidden_actor)
         
         return dictionary
-    
+
 class HistoryNetwork(nn.Module):
     def __init__(self):
         super(HistoryNetwork, self).__init__()
@@ -162,10 +160,10 @@ class HistoryNetwork(nn.Module):
         if hidden is not None:
             out, hidden_ = self.lstm_layers(x)
         else:
-            out, hidden_ = self.lstm_layers(x)
+            out, hidden_ = self.lstm_layers(x, hidden)
 
         return out, hidden_
-
+     
 class CriticNetwork(nn.Module):
     def __init__(self):
         super(CriticNetwork, self).__init__()
@@ -173,23 +171,23 @@ class CriticNetwork(nn.Module):
         self.critic_me = HistoryNetwork()
 
         self.critic_cf = nn.Sequential(
-            nn.Linear(obs_dim[-1] + n_actions, dim),
+            nn.Linear(obs_dim[-1], dim),
             nn.ReLU())
         
         self.critic_pi = nn.Sequential(nn.Linear(dim * 2, dim),
                                        nn.ReLU(),
-                                       nn.Linear(dim, 1))
+                                       nn.Linear(dim, n_actions))
 
         self.optimizer = optim.Adam(self.parameters(), lr=critic_lr)
-        #self.warmup_scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=critic_lr, last_epoch=1000)
+        self.scheduler = optim.lr_scheduler.LinearLR(self.optimizer, start_factor=1, end_factor=0, total_iters=total_plays)
 
         self.to(device)
 
-    def forward(self, state, action, history_actions, history_obs, hidden: tuple[torch.Tensor, torch.Tensor]):
+    def forward(self, state, history_actions, history_obs, hidden: tuple[torch.Tensor, torch.Tensor]):
         me, hidden_ = self.critic_me(history_actions, history_obs, hidden)
-        cf = self.critic_cf(torch.cat([state, action], dim=1))
-
+        cf = self.critic_cf(state)
         pi = self.critic_pi(torch.cat([me, cf], dim=1))
+
         return pi, hidden_
 
 class ActorNetwork(nn.Module):
@@ -200,16 +198,11 @@ class ActorNetwork(nn.Module):
         self.actor_cf = nn.Sequential(
             nn.Linear(obs_dim[-1], dim),
             nn.ReLU())
-        self.actor_pi = nn.Sequential(nn.Linear(2 * dim, dim),
-                                      nn.ReLU())
-        self.loc = nn.Sequential(nn.Linear(dim, n_actions),
-                                    nn.Tanh())
-        self.scale = nn.Sequential(nn.Linear(dim, n_actions),
-                                    nn.Tanh())
-
+        self.actor_pi = nn.Sequential(nn.Linear(2 * dim, int(n_actions)),
+                                      nn.Softmax(dim=-1))
 
         self.optimizer = optim.Adam(self.parameters(), lr=actor_lr)
-        #self.warmup_scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=actor_lr, last_epoch=1000)
+        self.scheduler = optim.lr_scheduler.LinearLR(self.optimizer, start_factor=1, end_factor=0, total_iters=total_plays)
 
         self.to(device)
 
@@ -217,23 +210,19 @@ class ActorNetwork(nn.Module):
         me, hidden_ = self.actor_me(history_actions, history_obs, hidden)
         cf = self.actor_cf(state)
         pi = self.actor_pi(torch.cat([me, cf], dim=-1))
-
-        loc = self.loc(pi)
-        scale_log = self.scale(pi)
-        scale_log = torch.clamp(scale_log, min=-20, max=2)
-
-        return loc, scale_log, hidden_
+       
+        return pi, hidden_
 
     def sample_normal(self, state, history_actions, history_obs, hidden=None):
-        loc, scale_log, hidden_ = self.forward(state, history_actions, history_obs, hidden)
-        scale = scale_log.exp()
-        dist = Normal(loc, scale)
+        action_probs, hidden_ = self.forward(state, history_actions, history_obs, hidden)
+        
+        action = torch.argmax(action_probs, dim=-1)
 
-        sample = dist.rsample()
+        z = action_probs == 0.0
+        z = z.float() * 1e-8
+        log_probs = torch.log(action_probs + z)
 
-        action = torch.tanh(sample)*torch.tensor(env.action_space.high).to(device)
-
-        return action, hidden_
+        return action, log_probs, action_probs, hidden_
     
 class Agent():
     def __init__(self):
@@ -241,29 +230,34 @@ class Agent():
 
         def init_weights(m):
             if isinstance(m, nn.Linear):
-                torch.nn.init.xavier_uniform_(m.weight)
-                
+                nn.init.xavier_normal_(m.weight)
+                nn.init.zeros_(m.bias)
+
         self.actor = ActorNetwork()
-        self.actor_target = ActorNetwork()
         self.critic_1 = CriticNetwork()
         self.critic_2 = CriticNetwork()
         self.critic_1_target = CriticNetwork()
         self.critic_2_target = CriticNetwork()
 
-        #self.actor.apply(init_weights)
-        #self.critic_1.apply(init_weights)
-        #self.critic_2.apply(init_weights)
+        self.actor.apply(init_weights)
+        self.critic_1.apply(init_weights)
+        self.critic_2.apply(init_weights)
 
         self.critic_1_target.load_state_dict(self.critic_1.state_dict())
         self.critic_2_target.load_state_dict(self.critic_2.state_dict())
-        self.actor_target.load_state_dict(self.actor_target.state_dict())
+
+        self.alpha = alpha_start
+        self.log_alpha = torch.zeros(1, requires_grad=True, device=device)
+        self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=critic_lr)
+        self.alpha_scheduler = optim.lr_scheduler.LinearLR(self.alpha_optimizer, start_factor=1, end_factor=0, total_iters=total_plays)
+        self.target_entropy = -n_actions
 
     def choose_action(self, observation):
         dic = self.memory.sample_history_sequence(memory_length)
         history_actions = dic["history_actions"].to(device)
         history_obs = dic["history_obs"].to(device)
         state = torch.tensor(np.array([observation]), dtype=torch.float).to(device)
-        actions, _ = self.actor.sample_normal(state, history_actions, history_obs)
+        actions, _, _, _ = self.actor.sample_normal(state, history_actions, history_obs)
 
         return actions.cpu().detach().numpy()[0]
 
@@ -272,7 +266,6 @@ class Agent():
 
     def gradient_step(self):
         if self.memory.mem_cntr < batch_size:
-
             return None, None, None
         
         for _ in range(num_epochs):
@@ -290,17 +283,15 @@ class Agent():
             dones = torch.tensor(dct["dones"], dtype=torch.bool).to(device)
 
             # Critics gradient step
-            actions_, _ = self.actor_target.sample_normal(state_, history_actions, history_obs, hidden_actor)
+            _, _, action_probs_, _ = self.actor.sample_normal(state_, history_actions, history_obs, hidden_actor)
             
             with torch.no_grad():
-                noise = (torch.randn_like(actions) * policy_noise).clamp(-noise_clip, noise_clip).to(device)
-                actions_ = (actions_ + noise).clamp(torch.tensor(env.action_space.low, device=device), torch.tensor(env.action_space.high, device=device))
-                q1_target_value, _ = self.critic_1_target.forward(state_, actions_, history_actions, history_obs, hidden_critic1)
-                q2_target_value, _ = self.critic_2_target.forward(state_, actions_, history_actions, history_obs, hidden_critic2)
-                q_target_value = torch.min(q2_target_value, q1_target_value)
+                q1_target_value, _ = self.critic_1_target.forward(state_, history_actions, history_obs, hidden_critic1)
+                q2_target_value, _ = self.critic_2_target.forward(state_, history_actions, history_obs, hidden_critic2)
+                q_target_value = torch.min(q2_target_value, q1_target_value) * action_probs_
                 q_hat = reward.view(batch_size, -1) + gamma * ~(dones.view(batch_size, -1)) * q_target_value
-            q1_value, hidden_critic1_ = self.critic_1.forward(state, actions, history_actions, history_obs, hidden_critic1)
-            q2_value, hidden_critic2_ = self.critic_2.forward(state, actions, history_actions, history_obs, hidden_critic2)
+            q1_value, hidden_critic1_ = self.critic_1.forward(state, history_actions, history_obs, hidden_critic1)
+            q2_value, hidden_critic2_ = self.critic_2.forward(state, history_actions, history_obs, hidden_critic2)
             q1_loss = 0.5 * F.mse_loss(q1_value, q_hat)
             q2_loss = 0.5 * F.mse_loss(q2_value, q_hat)
             
@@ -312,12 +303,22 @@ class Agent():
             self.critic_2.optimizer.step()
 
             # Policy gradient step
-            actions_reparam, hidden_actor_ = self.actor.sample_normal(state, history_actions, history_obs, hidden_actor)
-            q1_value, _ = self.critic_1.forward(state, actions_reparam, history_actions, history_obs, hidden_critic1)
-            actor_loss = -q1_value.mean()
+            _, log_probs, action_probs, hidden_actor_ = self.actor.sample_normal(state, history_actions, history_obs, hidden_actor)
+            q1_value, _ = self.critic_1.forward(state, history_actions, history_obs, hidden_critic1)
+            q2_value, _ = self.critic_2.forward(state, history_actions, history_obs, hidden_critic2)
+            q_value = torch.min(q1_value, q2_value)
+            actor_loss = (action_probs * (self.alpha * log_probs - q_value)).mean()
             self.actor.zero_grad()
             actor_loss.backward()
             self.actor.optimizer.step()
+
+            # Alpha gradient step
+            _, log_probs, action_probs, _ = self.actor.sample_normal(state, history_actions, history_obs, hidden_actor)
+            alpha_loss = -(action_probs * self.log_alpha * (log_probs + self.target_entropy).detach()).mean()
+            self.alpha_optimizer.zero_grad()
+            alpha_loss.backward()
+            self.alpha_optimizer.step()
+            self.alpha = self.log_alpha.exp().item()
 
             # Target critic weights update
             for param, target_param in zip(self.critic_1.parameters(), self.critic_1_target.parameters()):
@@ -326,33 +327,29 @@ class Agent():
             for param, target_param in zip(self.critic_2.parameters(), self.critic_2_target.parameters()):
                 target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
 
-            for param, target_param in zip(self.actor.parameters(), self.actor_target.parameters()):
-                target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
-
-        return hidden_actor_, hidden_critic1_, hidden_critic2_
+            return hidden_actor_, hidden_critic1_, hidden_critic2_
     
     def save_model(self):
         model_scripted = torch.jit.script(self.actor)
-        model_scripted.save("models/walker_test" + "_final.pth")
+        model_scripted.save("models/unity_test" + "_final.pth")
 
 pbar = tqdm(total=total_plays)
 pbar.reset()
 
-
 agent = Agent()
-best_score = -1000000
+best_score = -100000
 score_history = []
 
 global_step = 0
 for i in range(total_plays):
-    observation, _ = env.reset()
+    observation = env.reset()
     done = False
     score = 0
     iter_steps = 0
     while not done:
         action = agent.choose_action(observation)
-        observation_, reward, terminated, truncated, _ = env.step(action)
-        done = terminated or truncated
+        observation_, reward, terminated, _ = env.step(action)
+        done = terminated
         score += reward
         if iter_steps % N == 0:
             hidden_actor, hidden_critic1, hidden_critic2 = agent.gradient_step()
@@ -360,6 +357,18 @@ for i in range(total_plays):
         iter_steps += 1
         global_step += 1
         observation = observation_
+    score_history.append(score)
+    avg_score = np.mean(score_history[-100:])
+
+    if avg_score > best_score:
+        best_score = avg_score
+        agent.save_model()
+
+    # if global_step > batch_size:
+    #     agent.critic_1.scheduler.step()
+    #     agent.critic_2.scheduler.step()
+    #     agent.actor.scheduler.step()
+    #     agent.alpha_scheduler.step()
 
     pbar.update()
 
