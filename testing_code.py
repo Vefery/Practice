@@ -12,11 +12,10 @@ import gymnasium as gym
 from torch.distributions.categorical import Categorical
 from mlagents_envs.environment import UnityEnvironment
 from mlagents_envs.envs.unity_gym_env import UnityToGymWrapper
+import multiprocessing as mp
 
 device = (torch.device("cuda"))
-dim = 256
-memory_length = 32
-lstm_layers = 1
+dim = 128
 critic_lr = 3e-4
 actor_lr = critic_lr / 3.0
 reparam_noise = 1e-6
@@ -24,21 +23,18 @@ gamma=0.99
 tau=0.005
 alpha_start = 1
 max_size = 1000000
-batch_size = 512
+batch_size = 64
 total_plays = 50000
 num_epochs = 1
-N = 1
+N = 100
 
-unity_env = UnityEnvironment("D:\Practice\SentisInfrence\Build\SentisInfrence.exe", no_graphics=True)
-env = UnityToGymWrapper(unity_env)
+# unity_env = UnityEnvironment("D:\Practice\SentisInfrence\Build\SentisInfrence.exe", no_graphics=True)
+# env = UnityToGymWrapper(unity_env)
 
-#env = gym.make("CartPole-v1")
+env = gym.make("CartPole-v1")
 
 obs_dim = env.observation_space.shape
 n_actions=env.action_space.n
-
-print(obs_dim)
-print(n_actions)
 
 class ReplayBuffer():
     def __init__(self, max_size, input_shape, n_actions):
@@ -49,11 +45,8 @@ class ReplayBuffer():
         self.action_memory = np.zeros((self.mem_size, n_actions))
         self.reward_memory = np.zeros(self.mem_size)
         self.done_memory = np.zeros((self.mem_size), dtype=bool)
-        self.hidden_cr1 = (torch.zeros((1, dim), dtype=torch.float).to(device), torch.zeros((1, dim), dtype=torch.float).to(device))
-        self.hidden_cr2 = (torch.zeros((1, dim), dtype=torch.float).to(device), torch.zeros((1, dim), dtype=torch.float).to(device))
-        self.hidden_actor = (torch.zeros((1, dim), dtype=torch.float).to(device), torch.zeros((1, dim), dtype=torch.float).to(device))
 
-    def store_transition(self, state, action, reward, state_, dones, hidden_actor, hidden_critic1, hidden_critic2):
+    def store_transition(self, state, action, reward, state_, dones):
         index = self.mem_cntr % self.mem_size
 
         self.state_memory[index] = state
@@ -61,187 +54,89 @@ class ReplayBuffer():
         self.action_memory[index] = action
         self.reward_memory[index] = reward
         self.done_memory[index] = dones
-        if hidden_actor is not None and hidden_critic1 is not None and hidden_critic2 is not None:
-            self.hidden_cr1 = (hidden_critic1[0].detach(), hidden_critic1[0].detach())
-            self.hidden_cr2 = (hidden_critic2[0].detach(), hidden_critic2[0].detach())
-            self.hidden_actor = (hidden_actor[0].detach(), hidden_actor[0].detach())
 
         self.mem_cntr += 1
+
+    def sample_buffer(self, batch_size):
+        max_mem = min(self.mem_cntr, self.mem_size)
+
+        batch = np.random.choice(max_mem, batch_size)
+
+        states = self.state_memory[batch]
+        states_ = self.new_state_memory[batch]
+        actions = self.action_memory[batch]
+        rewards = self.reward_memory[batch]
+        dones = self.done_memory[batch]
+
+        return states, actions, rewards, states_, dones
     
-    def sample_history_sequence(self, history_length):
-        max_mem = min(self.mem_cntr, self.mem_size)
-        if max_mem <= history_length:
-            hist_part1 = torch.zeros(1, n_actions * memory_length)
-            hist_part2 = torch.zeros(1, obs_dim[0] * memory_length)
-        else:
-            hist_states = np.zeros([1, history_length, obs_dim[0]])
-            hist_actions = np.zeros([1, history_length, n_actions])
-
-            id = max_mem - 1
-            hist_start_id = id - history_length
-            if hist_start_id < 0:
-                hist_start_id = 0
-            # If exist done before the last experience (not including the done in id), start from the index next to the done.
-            if len(np.where(self.done_memory[hist_start_id:id] == 1)[0]) != 0:
-                hist_start_id = hist_start_id + (np.where(self.done_memory[hist_start_id:id] == True)[0][-1]) + 1
-            hist_seg_len = id - hist_start_id
-            hist_states[0, :hist_seg_len, :] = self.state_memory[hist_start_id:id]
-            hist_actions[0, :hist_seg_len, :] = self.action_memory[hist_start_id:id]
-
-            hist_part1 = torch.tensor(hist_actions, dtype=torch.float).reshape(1, -1)
-            hist_part2 = torch.tensor(hist_states, dtype=torch.float).reshape(1, -1)
-
-        dictionary = dict(history_actions=hist_part1,
-                          history_obs=hist_part2)
-        return dictionary
-
-    def sample_buffer_history(self, batch_size, history_length):
-        max_mem = min(self.mem_cntr, self.mem_size)
-        batch = np.random.randint(history_length, max_mem, batch_size)
-
-        if history_length == 0:
-                hist_states = np.zeros([batch_size, 1, obs_dim[0]])
-                hist_actions = np.zeros([batch_size, 1, n_actions])
-                hist_states_len = np.zeros(batch_size)
-        else:
-            hist_states = np.zeros([batch_size, history_length, obs_dim[0]])
-            hist_actions = np.zeros([batch_size, history_length, n_actions])
-            hist_states_len = history_length * np.ones(batch_size)
-
-            for i, id, in enumerate(batch):
-                hist_start_id = id - history_length
-                if hist_start_id < 0:
-                    hist_start_id = 0
-                # If exist done before the last experience (not including the done in id), start from the index next to the done.
-                if len(np.where(self.done_memory[hist_start_id:id] == 1)[0]) != 0:
-                    hist_start_id = hist_start_id + (np.where(self.done_memory[hist_start_id:id] == True)[0][-1]) + 1
-                hist_seg_len = id - hist_start_id
-                hist_states_len[i] = hist_seg_len
-                hist_states[i, :hist_seg_len, :] = self.state_memory[hist_start_id:id]
-                hist_actions[i, :hist_seg_len, :] = self.action_memory[hist_start_id:id]
-
-        hist_part1 = torch.tensor(hist_actions, dtype=torch.float).reshape(batch_size, -1)
-        hist_part2 = torch.tensor(hist_states, dtype=torch.float).reshape(batch_size, -1)
-
-        if batch_size <= max_mem:
-            dictionary = dict(states=self.state_memory[batch],
-                        states_=self.new_state_memory[batch],
-                        actions=self.action_memory[batch],
-                        rewards=self.reward_memory[batch],
-                        dones=self.done_memory[batch],
-                        history_actions=hist_part1,
-                        history_obs=hist_part2,
-                        hidden_critic1=self.hidden_cr1,
-                        hidden_critic2=self.hidden_cr2,
-                        hidden_actor=self.hidden_actor)
-        else:
-            dictionary = dict(history_actions=hist_part1,
-                              history_obs=hist_part2,
-                              hidden_critic1=self.hidden_cr1,
-                              hidden_critic2=self.hidden_cr2,
-                              hidden_actor=self.hidden_actor)
-        
-        return dictionary
-
-class HistoryNetwork(nn.Module):
-    def __init__(self):
-        super(HistoryNetwork, self).__init__()
-
-        self.fc_layers = nn.Sequential(nn.Linear((obs_dim[-1] + n_actions) * memory_length, dim),
-                                       nn.ReLU())
-        self.lstm_layers = nn.LSTM(dim, dim, num_layers=lstm_layers, batch_first=True)
-        
-        self.to(device)
-
-    def forward(self, history_actions, history_obs, hidden: tuple[torch.Tensor, torch.Tensor]):
-        history = torch.cat((history_actions, history_obs), dim=-1)
-
-        x = self.fc_layers(history)
-        if hidden is not None:
-            out, hidden_ = self.lstm_layers(x)
-        else:
-            out, hidden_ = self.lstm_layers(x, hidden)
-
-        return out, hidden_
-     
 class CriticNetwork(nn.Module):
     def __init__(self):
         super(CriticNetwork, self).__init__()
 
-        self.critic_me = HistoryNetwork()
-
-        self.critic_cf = nn.Sequential(
+        self.layers = nn.Sequential(
             nn.Linear(obs_dim[-1], dim),
-            nn.ReLU())
-        
-        self.critic_pi = nn.Sequential(nn.Linear(dim * 2, dim),
-                                       nn.ReLU(),
-                                       nn.Linear(dim, n_actions))
+            nn.ReLU(),
+            nn.Linear(dim, dim),
+            nn.ReLU(),
+            nn.Linear(dim, n_actions)
+        )
 
         self.optimizer = optim.Adam(self.parameters(), lr=critic_lr)
         self.scheduler = optim.lr_scheduler.LinearLR(self.optimizer, start_factor=1, end_factor=0, total_iters=total_plays)
 
         self.to(device)
 
-    def forward(self, state, history_actions, history_obs, hidden: tuple[torch.Tensor, torch.Tensor]):
-        me, hidden_ = self.critic_me(history_actions, history_obs, hidden)
-        cf = self.critic_cf(state)
-        pi = self.critic_pi(torch.cat([me, cf], dim=1))
+    def forward(self, state):
+        q = self.layers(state)
 
-        return pi, hidden_
+        return q
 
 class ActorNetwork(nn.Module):
     def __init__(self):
         super(ActorNetwork, self).__init__()
 
-        self.actor_me = HistoryNetwork()
-        self.actor_cf = nn.Sequential(
-            nn.Linear(obs_dim[-1], dim),
-            nn.ReLU())
-        self.actor_pi = nn.Sequential(nn.Linear(2 * dim, int(n_actions)),
-                                      nn.Softmax(dim=-1))
+        self.layers = nn.Sequential(
+            nn.Linear(*obs_dim, dim),
+            nn.ReLU(),
+            nn.Linear(dim, dim),
+            nn.ReLU(),
+            nn.Linear(dim, int(n_actions)),
+            nn.Softmax(dim=-1)
+        )
 
         self.optimizer = optim.Adam(self.parameters(), lr=actor_lr)
         self.scheduler = optim.lr_scheduler.LinearLR(self.optimizer, start_factor=1, end_factor=0, total_iters=total_plays)
 
         self.to(device)
 
-    def forward(self, state, history_actions, history_obs, hidden: tuple[torch.Tensor, torch.Tensor]):
-        me, hidden_ = self.actor_me(history_actions, history_obs, hidden)
-        cf = self.actor_cf(state)
-        pi = self.actor_pi(torch.cat([me, cf], dim=-1))
+    def forward(self, state):
+        action_probs = self.layers(state)
        
-        return pi, hidden_
 
-    def sample_normal(self, state, history_actions, history_obs, hidden=None):
-        action_probs, hidden_ = self.forward(state, history_actions, history_obs, hidden)
+        return action_probs
+
+    def sample_normal(self, state):
+        action_probs = self.forward(state)
         
-        action = torch.argmax(action_probs, dim=-1)
+        dist = Categorical(action_probs)
+        action = dist.sample()
 
         z = action_probs == 0.0
         z = z.float() * 1e-8
         log_probs = torch.log(action_probs + z)
 
-        return action, log_probs, action_probs, hidden_
+        return action, log_probs, action_probs
     
 class Agent():
     def __init__(self):
         self.memory = ReplayBuffer(max_size, obs_dim, n_actions)
-
-        def init_weights(m):
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_normal_(m.weight)
-                nn.init.zeros_(m.bias)
 
         self.actor = ActorNetwork()
         self.critic_1 = CriticNetwork()
         self.critic_2 = CriticNetwork()
         self.critic_1_target = CriticNetwork()
         self.critic_2_target = CriticNetwork()
-
-        self.actor.apply(init_weights)
-        self.critic_1.apply(init_weights)
-        self.critic_2.apply(init_weights)
 
         self.critic_1_target.load_state_dict(self.critic_1.state_dict())
         self.critic_2_target.load_state_dict(self.critic_2.state_dict())
@@ -253,45 +148,37 @@ class Agent():
         self.target_entropy = -n_actions
 
     def choose_action(self, observation):
-        dic = self.memory.sample_history_sequence(memory_length)
-        history_actions = dic["history_actions"].to(device)
-        history_obs = dic["history_obs"].to(device)
-        state = torch.tensor(np.array([observation]), dtype=torch.float).to(device)
-        actions, _, _, _ = self.actor.sample_normal(state, history_actions, history_obs)
+        state = torch.tensor(np.array([observation], dtype=float), dtype=torch.float).to(device)
+        actions, _, _ = self.actor.sample_normal(state)
 
         return actions.cpu().detach().numpy()[0]
 
-    def remember(self, state, action, reward, new_state, dones, hidden_critic1, hidden_critic2, hidden_actor):
-        self.memory.store_transition(state, action, reward, new_state, dones, hidden_critic1, hidden_critic2, hidden_actor)
+    def remember(self, state, action, reward, new_state, dones):
+        self.memory.store_transition(state, action, reward, new_state, dones)
 
     def gradient_step(self):
         if self.memory.mem_cntr < batch_size:
-            return None, None, None
+            return
         
         for _ in range(num_epochs):
-            dct = self.memory.sample_buffer_history(batch_size, memory_length)
+            state, actions, reward, state_, dones = self.memory.sample_buffer(batch_size)
 
-            history_actions = dct["history_actions"].detach().to(device)
-            history_obs = dct["history_obs"].detach().to(device)
-            hidden_critic1 = dct["hidden_critic1"]
-            hidden_critic2 = dct["hidden_critic2"]
-            hidden_actor = dct["hidden_actor"]
-            reward = torch.tensor(dct["rewards"], dtype=torch.float).to(device)
-            state_ = torch.tensor(dct["states_"], dtype=torch.float).to(device)
-            state = torch.tensor(dct["states"], dtype=torch.float).to(device)
-            actions = torch.tensor(dct["actions"], dtype=torch.float).to(device)
-            dones = torch.tensor(dct["dones"], dtype=torch.bool).to(device)
+            reward = torch.tensor(reward, dtype=torch.float).to(device)
+            state_ = torch.tensor(state_, dtype=torch.float).to(device)
+            state = torch.tensor(state, dtype=torch.float).to(device)
+            actions = torch.tensor(actions, dtype=torch.float).to(device)
+            dones = torch.tensor(dones, dtype=torch.bool).to(device)
 
             # Critics gradient step
-            _, _, action_probs_, _ = self.actor.sample_normal(state_, history_actions, history_obs, hidden_actor)
+            _, _, action_probs_ = self.actor.sample_normal(state_)
             
             with torch.no_grad():
-                q1_target_value, _ = self.critic_1_target.forward(state_, history_actions, history_obs, hidden_critic1)
-                q2_target_value, _ = self.critic_2_target.forward(state_, history_actions, history_obs, hidden_critic2)
+                q1_target_value = self.critic_1_target.forward(state_)
+                q2_target_value = self.critic_2_target.forward(state_)
                 q_target_value = torch.min(q2_target_value, q1_target_value) * action_probs_
                 q_hat = reward.view(batch_size, -1) + gamma * ~(dones.view(batch_size, -1)) * q_target_value
-            q1_value, hidden_critic1_ = self.critic_1.forward(state, history_actions, history_obs, hidden_critic1)
-            q2_value, hidden_critic2_ = self.critic_2.forward(state, history_actions, history_obs, hidden_critic2)
+            q1_value = self.critic_1.forward(state).gather(1, actions.long())
+            q2_value = self.critic_2.forward(state).gather(1, actions.long())
             q1_loss = 0.5 * F.mse_loss(q1_value, q_hat)
             q2_loss = 0.5 * F.mse_loss(q2_value, q_hat)
             
@@ -303,9 +190,9 @@ class Agent():
             self.critic_2.optimizer.step()
 
             # Policy gradient step
-            _, log_probs, action_probs, hidden_actor_ = self.actor.sample_normal(state, history_actions, history_obs, hidden_actor)
-            q1_value, _ = self.critic_1.forward(state, history_actions, history_obs, hidden_critic1)
-            q2_value, _ = self.critic_2.forward(state, history_actions, history_obs, hidden_critic2)
+            _, log_probs, action_probs = self.actor.sample_normal(state)
+            q1_value = self.critic_1.forward(state)
+            q2_value = self.critic_2.forward(state)
             q_value = torch.min(q1_value, q2_value)
             actor_loss = (action_probs * (self.alpha * log_probs - q_value)).mean()
             self.actor.zero_grad()
@@ -313,7 +200,7 @@ class Agent():
             self.actor.optimizer.step()
 
             # Alpha gradient step
-            _, log_probs, action_probs, _ = self.actor.sample_normal(state, history_actions, history_obs, hidden_actor)
+            _, log_probs, action_probs = self.actor.sample_normal(state)
             alpha_loss = -(action_probs * self.log_alpha * (log_probs + self.target_entropy).detach()).mean()
             self.alpha_optimizer.zero_grad()
             alpha_loss.backward()
@@ -327,49 +214,53 @@ class Agent():
             for param, target_param in zip(self.critic_2.parameters(), self.critic_2_target.parameters()):
                 target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
 
-            return hidden_actor_, hidden_critic1_, hidden_critic2_
+            return
     
     def save_model(self):
         model_scripted = torch.jit.script(self.actor)
         model_scripted.save("models/unity_test" + "_final.pth")
 
-pbar = tqdm(total=total_plays)
-pbar.reset()
+def multiagent(observation):
+    agent.gradient_step()
+    action = agent.choose_action(observation)
+    observation_, reward, terminated, _, _ = env.step(action)
+    env.close()
+    return (observation, action, reward, observation_, terminated), agent
 
 agent = Agent()
-best_score = -100000
-score_history = []
+if __name__ == '__main__':
+    pbar = tqdm(total=total_plays)
 
-global_step = 0
-for i in range(total_plays):
-    observation = env.reset()
-    done = False
-    score = 0
-    iter_steps = 0
-    while not done:
-        action = agent.choose_action(observation)
-        observation_, reward, terminated, _ = env.step(action)
-        done = terminated
-        score += reward
-        if iter_steps % N == 0:
-            hidden_actor, hidden_critic1, hidden_critic2 = agent.gradient_step()
-        agent.remember(observation, action, reward, observation_, terminated, hidden_actor, hidden_critic1, hidden_critic2)
-        iter_steps += 1
-        global_step += 1
-        observation = observation_
-    score_history.append(score)
-    avg_score = np.mean(score_history[-100:])
+    best_score = -100000
+    score_history = []
 
-    if avg_score > best_score:
-        best_score = avg_score
-        agent.save_model()
+    global_step = 1
+    for i in range(total_plays):
+        observation, _ = env.reset()
+        done = False
+        score = 0
+        iter_steps = 1
+        while not done:
+            action = agent.choose_action(observation)
+            observation_, reward, terminated, truncated, _ = env.step(action)
+            done = terminated
+            score += reward
+            agent.remember(observation, action, reward, observation_, terminated)
+            if global_step % N == 0:
+                with mp.Pool(processes=2) as pool:
+                    results = pool.map(multiagent, [observation, observation])
+                    index_max = min(range(len(results)), key=results[0][2])
+                    agent = results[1][index_max]
+            iter_steps += 1
+            global_step += 1
+            observation = observation_
+        score_history.append(score)
+        avg_score = np.mean(score_history[-100:])
 
-    # if global_step > batch_size:
-    #     agent.critic_1.scheduler.step()
-    #     agent.critic_2.scheduler.step()
-    #     agent.actor.scheduler.step()
-    #     agent.alpha_scheduler.step()
+        if avg_score > best_score:
+            best_score = avg_score
+            agent.save_model()
 
-    pbar.update()
+        pbar.update()
 
-pbar.close() 
+    pbar.close() 
